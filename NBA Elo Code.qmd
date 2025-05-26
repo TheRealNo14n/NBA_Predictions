@@ -1,0 +1,1227 @@
+---
+title: "NBA Model"
+author: "Thomas Zwiller & Nolan Santacroce"
+format:
+  html:
+    toc: true
+    toc-location: left
+    self-contained: true
+jupyter: python3
+---
+```{python}
+#reading in the libraries we need
+import pandas as pd
+import numpy as np
+import time
+import regex as re
+import math
+import cbbpy.mens_scraper as scrape
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+import random
+from random import randrange
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import OneHotEncoder
+```
+
+List Helper Function
+```{python}
+def game_outcome(win_prob, team1, team2):
+    """
+    Simulate the outcome of a game given the favorite's win probability.
+    Returns team1 if the favorite wins, else team2.
+    """
+    sim_prob = randrange(1, 100) / 100  # simulated probability (0.01 to 0.99)
+    if win_prob > sim_prob:
+        return team1
+    else:
+        return team2
+```
+
+Game Odds Function
+```{python}
+def game_odds(team_rating, opp_team_rating):
+    """
+    Calculate the win probability for a team given its rating and the opponent's rating.
+    """
+    team_diff = (opp_team_rating - team_rating) / 400
+    divisor = (10 ** team_diff) + 1
+    return 1 / divisor
+
+```
+
+Game Sim Function
+```{python}
+def simulate_game(team1, team2):
+    rating1 = team_ratings[team1]
+    rating2 = team_ratings[team2]
+    if rating1 < rating2:
+        team1, team2 = team2, team1
+        rating1, rating2 = rating2, rating1
+    win_prob = game_odds(rating1, rating2)
+    return game_outcome(win_prob, team1, team2)
+```
+
+Play-In Function
+```{python}
+def play_in_func(game_list):
+    """
+    Simulate a play-in game between two teams.
+    """
+    team_a = game_list[0]
+    team_a_seed = game_list[1]
+    team_b = game_list[2]
+    team_b_seed = game_list[3]
+    winner_location = game_list[5]
+    winner_destination = game_list[4]
+    loser_destination = game_list[6]
+    loser_location = game_list[7]
+    advance_round = game_list[8]
+
+    team_a_rating = teams[team_a] + 75
+    team_b_rating = teams[team_b]
+    if team_a_rating < team_b_rating:
+        team_a, team_b = team_b, team_a
+        team_a_rating, team_b_rating = team_b_rating, team_a_rating
+    win_prob = game_odds(team_a_rating, team_b_rating)
+    winner = game_outcome(win_prob, team_a, team_b)
+
+    if winner == team_a:
+        winner_destination[winner_location] = team_a
+        winner_destination[winner_location + 1] = team_a_seed
+        team_progress[team_a][advance_round] += 1
+        if loser_destination is not None:
+            loser_destination[loser_location] = team_b
+            loser_destination[loser_location + 1] = team_b_seed
+            team_progress[team_b]['Play-In'] += 1
+    else:
+        winner_destination[winner_location] = team_b
+        winner_destination[winner_location + 1] = team_b_seed
+        team_progress[team_b][advance_round] += 1
+        if loser_destination is not None:
+            loser_destination[loser_location] = team_a
+            loser_destination[loser_location + 1] = team_a_seed
+            team_progress[team_a]['Play-In'] += 1
+    
+
+    return None
+```
+
+Playoff Round Function
+```{python}
+def playoff_func(game_list):
+
+    team_a = game_list[0]
+    team_a_seed = game_list[1]
+    team_a_wins = game_list[2]
+    team_b = game_list[3]
+    team_b_seed = game_list[4]
+    team_b_wins = game_list[5]
+    winner_location = game_list[7]
+    winner_destination = game_list[6]
+    advance_round = game_list[8]
+    game = team_a_wins + team_b_wins + 1
+
+    if team_a_seed > team_b_seed:
+        team_a, team_b = team_b, team_a
+        team_a_seed, team_b_seed = team_b_seed, team_a_seed
+        team_a_wins, team_b_wins = team_b_wins, team_a_wins
+
+    while team_a_wins < 4 and team_b_wins < 4:
+        is_home = game in [1, 2, 5, 7]
+        home_team = team_a if is_home else team_b
+        away_team = team_b if is_home else team_a
+
+        home_rating = teams[home_team] + 75
+        away_rating = teams[away_team]
+
+        if home_rating > away_rating:
+            favored_team = home_team
+            underdog_team = away_team
+            favored_rating = home_rating
+            underdog_rating = away_rating
+        else:
+            favored_team = away_team
+            underdog_team = home_team
+            favored_rating = away_rating
+            underdog_rating = home_rating
+
+        win_prob = game_odds(favored_rating, underdog_rating)
+        winner = game_outcome(win_prob, favored_team, underdog_team)
+
+# Update win counts based on winner
+        if winner == team_a:
+            team_a_wins += 1
+        else:
+            team_b_wins += 1
+        game += 1
+    if team_a_wins == 4:
+        winner_destination[winner_location] = team_a
+        winner_destination[winner_location + 1] = team_a_seed
+        team_progress[team_a][advance_round] += 1
+    else:
+        winner_destination[winner_location] = team_b
+        winner_destination[winner_location + 1] = team_b_seed
+        team_progress[team_b][advance_round] += 1
+    return None
+```
+
+Logo Resources
+```{python}
+#logo_df = pd.read_csv('/Users/TomTheIntern/Desktop/ZeLO/Coding Projectz/NBA Project/NBA_Logos__Markdown_Format_.csv')
+```
+
+NBA Historical Data
+```{python}
+count = 0
+right = 0
+
+nba_season_data = pd.read_csv('D:/S&Z 500 NBA/2002-2025 NBA Season Data.csv')
+
+recent_games = nba_season_data.sort_values(by='date', ascending=False)
+
+drop_contains = ['All-Stars', 'Team', 'USA', 'World', 'Usa', 'TBD', 'Leb']
+
+franchise_map = {
+    "New Jersey Nets": "Brooklyn Nets",
+    "Seattle SuperSonics": "Oklahoma City Thunder",
+    "Charlotte Bobcats": "Charlotte Hornets",
+    "New Orleans Hornets": "New Orleans Pelicans",
+    "NO/Oklahoma City Hornets": "New Orleans Pelicans",
+    "NO/Oklahoma City\r\n Hornets": "New Orleans Pelicans"
+}
+
+season_elo_dict = {}
+
+nba_season_data['home_display_name'] = nba_season_data['home_display_name'].replace(franchise_map)
+
+nba_season_data['away_display_name'] = nba_season_data['away_display_name'].replace(franchise_map)
+
+nba_season_data['pre_home_elo'] = np.nan
+nba_season_data['pre_away_elo'] = np.nan
+
+teams = {}
+
+nba_season_data = nba_season_data[nba_season_data['status_type_completed'] == True]
+
+for year in range(2002, 2026, 1):
+    year_data = nba_season_data[nba_season_data['season'] == year].copy()
+
+    year_data = year_data.sort_values(by='date')
+
+    for i in range(len(year_data)):
+      home = year_data.iloc[i]['home_display_name']
+      away = year_data.iloc[i]['away_display_name']
+
+      #and appends if they aren't in dict
+      if home not in teams:
+          teams[home] = 1500
+      if away not in teams:
+          teams[away] = 1500
+
+    #loops through the games
+    for index, row in year_data.iterrows():
+      home_team = row['home_display_name']
+      away_team = row['away_display_name']
+
+      #get final score
+      home_score = row['home_score']
+      away_score = row['away_score']
+
+      # Pre-game Elo for model building
+      year_data.at[index, 'pre_home_elo'] = teams[home_team]
+      year_data.at[index, 'pre_away_elo'] = teams[away_team]
+
+      # Get current ratings
+      home_team_rating = teams[home_team] + 75
+      away_team_rating = teams[away_team]
+
+      # Win probabilities
+      home_team_win_prob = 1 / (1 + 10 ** ((away_team_rating - home_team_rating) / 400))
+      away_team_win_prob = 1 - home_team_win_prob
+
+      # Update ratings
+      if home_score > away_score:
+        margin = abs(home_score - away_score)
+      else:
+        margin = abs(away_score - home_score)
+
+      K = 15 * math.log(margin + 1, 10)
+      #K = 20
+
+      #update ratings based on the margin
+      if home_score > away_score:
+        teams[home_team] += K * (1 - home_team_win_prob)
+        teams[away_team] += K * (0 - away_team_win_prob)
+        if home_team_win_prob > .5:
+            count += 1
+            right += 1
+        else:
+            count += 1
+      else:
+        teams[home_team] += K * (0 - home_team_win_prob)
+        teams[away_team] += K * (1 - away_team_win_prob)
+        if away_team_win_prob > .5:
+            count += 1
+            right += 1
+        else:
+            count += 1
+
+    team_average = sum(teams.values()) / len(teams)
+
+    for team in teams:
+        concatenated_team = team + '-' + str(year)
+        season_elo_dict[concatenated_team] = teams[team]
+
+    for team in teams:
+        if teams[team] >= team_average:
+            team_modifier = (teams[team] - 1500) * .30
+            teams[team] = teams[team] - team_modifier
+        else:
+            teams_modifier = (1500 - teams[team]) * .30
+            teams[team] = teams[team] + teams_modifier
+
+    nba_season_data.loc[year_data.index, ['pre_home_elo', 'pre_away_elo']] = year_data[['pre_home_elo', 'pre_away_elo']]
+
+team_ratings_df = pd.DataFrame.from_dict(teams, orient='index', columns=['Elo Rating'])
+team_ratings_df.index.name = 'Team'
+team_ratings_df = team_ratings_df.reset_index()
+
+team_ratings_df = team_ratings_df[~team_ratings_df['Team'].str.contains('|'.join(drop_contains), case=False, na=False)]
+
+team_ratings_df = team_ratings_df[['Team', 'Elo Rating']].sort_values(by = 'Elo Rating', ascending = False, ignore_index = True)
+
+team_ratings_df.to_csv('D:/S&Z 500 NBA/NBA 2025 Elo Ratings.csv', index = True)
+
+season_elo_dict_df = pd.DataFrame.from_dict(season_elo_dict, orient='index', columns=['Elo Rating'])
+season_elo_dict_df.index.name = 'Team-Year'
+season_elo_dict_df = season_elo_dict_df.reset_index()
+season_elo_dict_df = season_elo_dict_df[~season_elo_dict_df['Team-Year'].str.contains('|'.join(drop_contains), case=False, na=False)]
+season_elo_dict_df = season_elo_dict_df[['Team-Year', 'Elo Rating']].sort_values(by = 'Elo Rating', ascending = False, ignore_index = True)
+season_elo_dict_df.to_csv('D:/S&Z 500 NBA/NBA 2025 Elo Ratings by Year.csv', index = True)
+
+print(f"Accuracy: {right/count:.2%}")
+```
+
+NBA Playoffs
+```{python}
+team_progress = {
+    team_name: {
+        "Play-In": 0,
+        "First Round": 0,
+        "Semifinals": 0,
+        "Conference Finals": 0,
+        "NBA Finals": 0,
+        "Champion": 0
+    }
+    for team_name in teams.keys()
+}
+
+num_sims = int(input("Please enter the number of simulations: \n"))
+
+for i in range(num_sims):
+    #The Finals
+    champs = [None, None]
+
+    nba_finals = [None, None, 0, None, None, 0, champs, 0, 'Champion']
+
+    #East Playoffs
+    east_finals = [None, None, 0, None, None, 0, nba_finals, 3, 'NBA Finals']
+    east_semi_2 = [None, None, 0, None, None, 0, east_finals, 3, 'Conference Finals']
+    east_semi_1 = [None, None, 0, None, None, 0, east_finals, 0, 'Conference Finals']
+    east_series_4 = ['Indiana Pacers', 4, 1, 'Milwaukee Bucks', 5, 0, east_semi_1, 3, 'Semifinals']
+    east_series_3 = ['New York Knicks', 3, 1, 'Detroit Pistons', 6, 1, east_semi_2, 3, 'Semifinals']
+    east_series_2 = ['Boston Celtics', 2, 1, 'Orlando Magic', 7, 0, east_semi_2, 0, 'Semifinals']
+    #the structure of the lists is:
+    #home team, home seed, home games won
+    #away team, away seed, away games won,
+    #destination, games won, round advanced
+    east_series_1 = ['Cleveland Cavaliers', 1, 1, 'Miami Heat', 8, 0, east_semi_1, 0, 'Semifinals']
+
+    #West Playoffs
+    west_finals = [None, None, 0, None, None, 0, nba_finals, 0, 'NBA Finals']
+    west_semi_2 = [None, None, 0, None, None, 0, west_finals, 3, 'Conference Finals']
+    west_semi_1 = [None, None, 0, None, None, 0, west_finals, 0, 'Conference Finals']
+    west_series_4 = ['Denver Nuggets', 4, 1, 'LA Clippers', 5, 1, west_semi_1, 3 , 'Semifinals']
+    west_series_3 = ['Los Angeles Lakers', 3, 0, 'Minnesota Timberwolves', 6, 1, west_semi_2, 3, 'Semifinals']
+    west_series_2 = ['Houston Rockets', 2, 0, 'Golden State Warriors', 7, 1, west_semi_2, 0 , 'Semifinals']
+    west_series_1 = ['Oklahoma City Thunder', 0, 1, 'Memphis Grizzlies', 8, 0, west_semi_1, 0 , 'Semifinals']
+
+    #East Play-In
+    #east_play_in_3 = ['Atlanta Hawks', 7, 'Miami Heat', 10, east_series_1, 3, None, None, 'First Round']
+    #east_play_in_1 = ['Atlanta Hawks', 7, 'Orlando Magic', 8, east_series_2, 2, east_play_in_3, 0, 'First Round']
+    #east_play_in_2 = ['Miami Heat', 10, 'Chicago Bulls', 9, east_play_in_3, 2, None, None, 'Play-In']
+
+    #West Play-In
+    #west_play_in_3 = ['Memphis Grizzlies', 8, 'Dallas Mavericks', 10, west_series_1, 3, None, None, 'First Round']
+    #west_play_in_1 = ['Golden State Warriors', 7, 'Memphis Grizzlies', 8,  west_series_2, 2, west_play_in_3, 0, 'First Round']
+    #west_play_in_2 = ['Sacramento Kings', 9, 'Dallas Mavericks', 10, west_play_in_3, 2, None, None, 'Play-In']
+
+    #East Playin 
+    #play_in_func(east_play_in_1)
+    #play_in_func(east_play_in_2)
+    #play_in_func(east_play_in_3)
+
+    #West Playin
+    #play_in_func(west_play_in_1)
+    #play_in_func(west_play_in_2)
+    #play_in_func(west_play_in_3)
+
+    #East Round 1
+    playoff_func(east_series_1)
+    playoff_func(east_series_2)
+    playoff_func(east_series_3)
+    playoff_func(east_series_4)
+
+    #West Round 1
+    playoff_func(west_series_1)
+    playoff_func(west_series_2)
+    playoff_func(west_series_3)
+    playoff_func(west_series_4)
+
+    #East Semis
+    playoff_func(east_semi_1)
+    playoff_func(east_semi_2)
+
+    #West Semis
+    playoff_func(west_semi_1)
+    playoff_func(west_semi_2)
+
+    #Conference Finals
+    playoff_func(west_finals)
+    playoff_func(east_finals)
+
+    #NBA Finals
+    playoff_func(nba_finals)
+
+df_progress = pd.DataFrame.from_dict(team_progress, orient='index')
+
+df_progress = df_progress.sort_values(by="Champion", ascending=False)
+
+df_progress = round((df_progress / num_sims) * 100, 2)
+
+df_progress = df_progress.reset_index().rename(columns={'index': 'Team'})
+
+df_progress = df_progress[~df_progress['Team'].str.contains('|'.join(drop_contains), case=False, na=False)]
+
+df_progress['Play-In'] = df_progress['Play-In'].replace(0.0, np.nan)
+df_progress['Play-In'] = df_progress['Play-In'].fillna('-')
+df_progress['First Round'] = df_progress['First Round'].replace(0.0, np.nan)
+df_progress['First Round'] = df_progress['First Round'].fillna('-')
+
+df_progress = df_progress.rename(columns={'Play-In': 'Play-In Elim'})
+
+df_progress = pd.merge(df_progress, logo_df, how='left')
+
+df_progress = pd.merge(df_progress, team_ratings_df, how='left')
+
+df_progress.to_csv('NBA 2025 Playoff Progress.csv', index = True)
+
+print(df_progress)
+```
+```{r}
+library(tidyverse)
+library(hoopR)
+library(ggplot2)
+```
+```{r}
+nba_team_box <- hoopR::load_nba_team_box(2025:hoopR::most_recent_nba_season())
+
+glue::glue("{nrow(nba_team_box)} rows of NBA team boxscore data from {length(unique(nba_team_box$game_id))} games.")
+
+dplyr::glimpse(nba_team_box)
+
+write.csv(nba_team_box, "D:/S&Z 500 NBA/NBA Team Box.csv", row.names = FALSE)
+```
+
+```{r}
+# Fetch advanced stats for theregular season
+advanced_stats <- hoopR::nba_leaguedashteamstats(
+  measure_type = "Advanced",
+  season = year_to_season(most_recent_nba_season() -1),
+  season_type = "Regular Season"
+)
+
+# Access the team stats data frame
+team_advanced_stats_25 <- advanced_stats$LeagueDashTeamStats
+
+# View the structure
+write.csv(team_advanced_stats_25, "2025 NBA Team Advanced Stats.csv", row.names = FALSE)
+```
+
+```{r}  
+
+# Defining a function to generate all seasons from 2002-2025 to the most recent season
+get_all_seasons <- function(start_year = 2002, end_year = most_recent_nba_season()) {
+  sapply(start_year:end_year, year_to_season)
+}
+
+# Get all seasons
+all_seasons <- get_all_seasons()
+
+# Fetch advanced stats for all seasons
+all_advanced_stats <- lapply(all_seasons, function(season) {
+  # Fetch data for each season
+  stats <- hoopR::nba_leaguedashteamstats(
+    measure_type = "Advanced",
+    season = season,
+    season_type = "Regular Season"
+  )
+  stats$LeagueDashTeamStats$SEASON <- season
+  return(stats$LeagueDashTeamStats)
+})
+# Creating the advanced stats for all seasons
+t1 <-  hoopR::nba_leaguedashteamstats(
+    measure_type = "Advanced",
+    season = 2002,
+    season_type = "Regular Season"
+  )
+
+t2 <-  hoopR::nba_leaguedashteamstats(
+    measure_type = "Advanced",
+    season = 2024,
+    season_type = "Regular Season"
+  )
+
+t2
+
+years <- c(2002:2025)
+
+res <- vector(mode = "list", length =length(years))
+#Looping the data to get all the seasons in 1 frame
+for(i in 1:length(years)){
+    try({
+        t1 <- hoopR::nba_leaguedashteamstats(
+            measure_type = "Advanced",
+            season = years[i],
+            season_type = "Regular Season"
+        )
+    }, silent = TRUE)
+
+    if (!is.null(t1)) {
+        t1$LeagueDashTeamStats$SEASON <- years[i]
+        res[[i]] <- t1$LeagueDashTeamStats
+    } else {
+        res[[i]] <- NULL
+    }
+
+    t1 <- NULL
+}
+
+# Combine all seasons into one data frame
+team_advanced_stats_all <- do.call(rbind, all_advanced_stats)
+
+# View the structure
+head(team_advanced_stats_all)
+library(dplyr)
+
+# Define the franchise_map as before
+franchise_map <- c(
+  "New Jersey Nets" = "Brooklyn Nets",
+  "Seattle SuperSonics" = "Oklahoma City Thunder",
+  "Charlotte Bobcats" = "Charlotte Hornets",
+  "New Orleans Hornets" = "New Orleans Pelicans",
+  "NO/Oklahoma City Hornets" = "New Orleans Pelicans",
+  "NO/Oklahoma City\r\n Hornets" = "New Orleans Pelicans"
+)
+
+# Update the team names using mutate and if_else
+team_advanced_stats_all <- team_advanced_stats_all %>%
+  mutate(Team = as.character(TEAM_NAME),
+         TEAM_NAME = if_else(
+           TEAM_NAME %in% names(franchise_map),
+           franchise_map[TEAM_NAME],
+           TEAM_NAME
+         )
+  )
+
+# Inspect the first few rows to verify the change:
+head(team_advanced_stats_all)
+
+write.csv(team_advanced_stats_all, "D:/S&Z 500 NBA/NBA Team Advanced Stats 2002-2025.csv", row.names = FALSE)
+```
+
+
+```{python}
+import pandas as pd
+import re
+
+# Read the CSV file
+df = pd.read_csv("D:/S&Z 500 NBA/NBA 2025 Elo Ratings by Year.csv")
+
+def convert_team_year_to_season(team_year):
+    """
+    Given a string in the format 'Team Name-YYYY',
+    extract the year and convert it to a season string "YYYY-YY",
+    e.g., "Golden State Warriors-2017" becomes "2016-17".
+    """
+    try:
+        # Split on the last '-' character.
+        name, year_str = team_year.rsplit("-", 1)
+        year_str = year_str.strip()  # remove any extra spaces
+        year = int(year_str)
+    except Exception:
+        # If splitting fails, try to extract the first occurrence of a 4-digit number via regex.
+        match = re.search(r'(\d{4})', team_year)
+        if match:
+            year = int(match.group(1))
+        else:
+            # If no year found, return None
+            return None
+
+    start_year = year - 1
+    # Construct season string: e.g., for 2017, season is "2016-17".
+    season = f"{start_year}-{str(year)[-2:]}"
+    return season
+
+# Create a new column 'SEASON' by applying the conversion function on the "Team_Year" column
+df["SEASON"] = df["Team_Year"].apply(convert_team_year_to_season)
+
+# (Optional) Remove the year part from the Team_Year column to keep only the team name,
+# and store the result in a new column "Team"
+def remove_year_from_team(team_year):
+    if "-" in team_year:
+        return team_year.rsplit("-", 1)[0].strip()
+    return team_year
+
+df["TEAM_NAME"] = df["Team_Year"].apply(remove_year_from_team)
+
+# (Optional) Save the updated dataframe to a new CSV file
+df.to_csv("NBA_2025_Elo_Ratings_by_Year_updated1.csv", index=False)
+
+# Display the first few rows to verify changes
+print(df.head())
+
+
+```
+```{python}
+import pandas as pd
+
+# Load the CSV files
+elo_df = pd.read_csv("D:/S&Z 500 NBA/NBA_2025_Elo_Ratings_by_Year_updated1.csv")
+advanced_stats_df = pd.read_csv("D:/S&Z 500 NBA/NBA Team Advanced Stats 2002-2025.csv")
+```
+```{python}
+
+print("Raw ELO columns:", [repr(col) for col in elo_df.columns.tolist()])
+print("Raw Advanced Stats columns:", [repr(col) for col in advanced_stats_df.columns.tolist()])
+```
+
+```{python}
+# Clean column names: strip whitespace and convert to uppercase
+elo_df.columns = elo_df.columns.str.strip().str.upper()
+advanced_stats_df.columns = advanced_stats_df.columns.str.strip().str.upper()
+
+# Fix the team name mismatch in the advanced stats DataFrame:
+# Change "Los Angeles Clippers" to "LA Clippers"
+advanced_stats_df["TEAM_NAME"] = advanced_stats_df["TEAM_NAME"].replace("Los Angeles Clippers", "LA Clippers")
+
+# Verify the columns and team names
+print("ELO DataFrame TEAM_NAME unique values:")
+print(elo_df["TEAM_NAME"].unique())
+print("\nAdvanced Stats DataFrame TEAM_NAME unique values:")
+print(advanced_stats_df["TEAM_NAME"].unique())
+
+# Merge the two DataFrames on TEAM_NAME and SEASON
+merged_df = pd.merge(
+    elo_df,
+    advanced_stats_df,
+    on=["TEAM_NAME", "SEASON"],
+    how="inner"  
+)
+
+# Taking a look at the merged DataFrame
+print("\nMerged DataFrame preview:")
+print(merged_df.head())
+
+# Save the merged DataFrame to a new CSV file
+merged_df.to_csv("D:/S&Z 500 NBA/Merged_ELO_AdvancedStats.csv", index=False)
+
+
+```
+
+```{python}
+# Load the merged DataFrame
+merged_df = pd.read_csv("D:/S&Z 500 NBA/Merged_ELO_AdvancedStats.csv")
+print("Merged DataFrame columns:", merged_df.columns.tolist())
+```
+```{r}
+nba_box <- hoopR::load_nba_team_box(seasons = years)
+
+head(nba_box)
+write.csv(nba_box, "D:/S&Z 500 NBA/NBA Team Box.csv", row.names = FALSE)
+```
+```{python}
+nba_box1 = pd.read_csv("D:/S&Z 500 NBA/NBA Team Box.csv")
+
+# Create the score differential
+nba_box1['score_diff'] = nba_box1['team_score'] - nba_box1['opponent_team_score']
+
+# Create the win column: 1 if team_score > opponent_team_score, else 0
+nba_box1['win'] = np.where(nba_box1['team_score'] > nba_box1['opponent_team_score'], 1, 0)
+#Converting the season format
+def convert_season(single_year):
+    """
+    Convert a season given as a single year (e.g., 2002) to a season span string (e.g., "2001-02").
+    """
+    try:
+        # Convert the input to an integer
+        year = int(single_year)
+        # Creating the season string and subtracting 1 for the starting year,
+        # then using the last two digits of the current year for the ending portion.
+        season_str = f"{year - 1}-{str(year)[-2:]}"
+        return season_str
+    except Exception as e:
+       
+        print(f"Error converting season {single_year}: {e}")
+        return single_year
+
+# Applying the conversion function to the SEASON column
+nba_box1["season"] = nba_box1["season"].apply(convert_season)
+
+nba_box1.to_csv("D:/S&Z 500 NBA/NBA Team Box1.csv", index = False)
+```
+```{r}
+nba_box1 <- read.csv("D:/S&Z 500 NBA/NBA Team Box1.csv")
+seq_1 <- seq(1, nrow(nba_box1)- 1,by =2 )
+seq_2 <- seq(2, nrow(nba_box1),by =2 )
+
+dat_1 <- nba_box1[seq_1,]
+dat_2 <- nba_box1[seq_2,]
+
+
+colnames(dat_1) <- paste0("away_",  colnames(dat_1))
+colnames(dat_2) <- paste0("home_",  colnames(dat_2))
+
+nba_box_wide <- cbind(dat_1, dat_2)
+
+nba_box_wide <- nba_box_wide[ , !duplicated(colnames(nba_box_wide))]
+
+# Inspect
+head(nba_box_wide)
+write.csv(nba_box_wide, "D:/S&Z 500 NBA/NBA Team Box Wide.csv", row.names = FALSE)
+```
+
+```{r}
+
+# Selecting the columns
+selected <- nba_box_wide %>%
+  select(
+    home_game_id,
+    home_game_date,
+    home_season,
+    home_team_display_name,
+    away_team_display_name,
+    home_team_score,
+    away_team_score,
+    home_score_diff,
+    away_score_diff,
+    home_win,
+    away_win,
+    home_total_rebounds,
+    home_assists,
+    home_steals,
+    home_blocks,
+    home_turnovers,
+    home_field_goals_made,
+    home_field_goals_attempted,
+    home_three_point_field_goals_made,
+    home_three_point_field_goals_attempted,
+    home_free_throws_made,
+    home_free_throws_attempted,
+    home_offensive_rebounds,
+    home_defensive_rebounds,
+    home_fouls,
+    home_field_goal_pct,
+    home_three_point_field_goal_pct,
+    home_free_throw_pct,
+    away_total_rebounds,
+    away_season,
+    away_assists,
+    away_steals,
+    away_blocks, 
+    away_turnovers,
+    away_field_goals_made,
+    away_field_goals_attempted,
+    away_three_point_field_goals_made,
+    away_three_point_field_goals_attempted,
+    away_free_throws_made,
+    away_free_throws_attempted,
+    away_offensive_rebounds,
+    away_defensive_rebounds,
+    away_fouls,
+    away_field_goal_pct,
+    away_three_point_field_goal_pct,
+    away_free_throw_pct)
+
+# View the result
+head(selected)
+write.csv(selected, "D:/S&Z 500 NBA/NBA Team Box Final.csv", row.names = FALSE)
+```
+```{r}
+nba_box_final <- read.csv("D:/S&Z 500 NBA/NBA Team Box Final.csv")
+
+franchise_map <- c(
+  "New Jersey Nets"               = "Brooklyn Nets",
+  "Seattle SuperSonics"           = "Oklahoma City Thunder",
+  "Charlotte Bobcats"             = "Charlotte Hornets",
+  "New Orleans Hornets"           = "New Orleans Pelicans",
+  "NO/Oklahoma City Hornets"      = "New Orleans Pelicans",
+  "NO/Oklahoma City\r\n Hornets"  = "New Orleans Pelicans"
+)
+
+
+clean_names <- function(x) {
+  x <- as.character(x)
+  idx <- x %in% names(franchise_map)
+  x[idx] <- franchise_map[x[idx]]
+  x
+}
+
+nba_box_final <- nba_box_final %>%
+  mutate(
+    home_team_display_name = clean_names(home_team_display_name),
+    away_team_display_name = clean_names(away_team_display_name)
+  )
+glimpse(nba_box_final)
+write.csv(nba_box_final, "D:/S&Z 500 NBA/NBA Team Box Final.csv", row.names = FALSE)
+```
+```{r}
+
+# 1) define the “bad” seasons and teams
+bad_seasons <- "2001-02"
+bad_teams   <- c("Western Conf All-Stars", "Team Shaq", "Team Chuck", "Team Garnett", "World", "Leb", "Eastern Conf All-Stars", "Team Kenny", "Team Ernie", "Team Chris", "Team Dwyane", "Team Kobe", "Team Giannis", "Team Luka", "Team Jokic","Team Malone", "Team Iverson", "Team Lebron", "Team Durant", "NBA Rising Stars")
+
+# 2) Filtering like a brita
+nba_box_clean <- nba_box_final %>%
+  filter(
+    !home_season  %in% bad_seasons,
+    !away_season  %in% bad_seasons,
+    !home_team_display_name       %in% bad_teams,
+    !away_team_display_name %in% bad_teams
+  )
+
+# 3) To the left to the left (join)
+adv_stats <- read.csv("D:/S&Z 500 NBA/Merged_ELO_AdvancedStats.csv", stringsAsFactors=FALSE) %>%
+  mutate(
+    TEAM_NAME = trimws(TEAM_NAME),
+    SEASON    = trimws(SEASON)
+  )
+
+adv_home <- adv_stats %>%
+  rename(home_team_display_name = TEAM_NAME,
+         home_season            = SEASON) %>%
+  rename_with(~ paste0("home_", .), -c(home_team_display_name,home_season))
+
+adv_away <- adv_stats %>%
+  rename(away_team_display_name = TEAM_NAME,
+         away_season                     = SEASON) %>%
+  rename_with(~ paste0("away_", .), -c(away_team_display_name,away_season))
+
+model_df <- nba_box_clean %>%
+  left_join(adv_home, by = c("home_team_display_name","home_season")) %>%
+  left_join(adv_away, by = c("away_team_display_name","away_season"))
+
+# Doing a quick check that nothing is NA:
+model_df %>% 
+  summarise(
+    pct_home_ELO_NA = mean(is.na(home_ELO.RATING)),
+    pct_away_ELO_NA = mean(is.na(away_ELO.RATING))
+  )
+
+write.csv(model_df, "D:/S&Z 500 NBA/NBA Model Data.csv", row.names = FALSE)
+```
+```{r}
+library(stringr)
+
+model_df <- read.csv("D:/S&Z 500 NBA/NBA Model Data.csv", 
+                     stringsAsFactors = FALSE, 
+                     check.names = FALSE) %>%
+  # 1) replace every dot with underscore
+  rename_with(~ str_replace_all(., "\\.", "_")) %>%
+  # 2) (optional) make everything lowercase
+  rename_with(tolower)
+
+# Inspect to confirm
+glimpse(model_df)
+
+```
+```{r}
+library(dplyr)
+# install.packages("slider")
+library(slider)
+library(stringr)
+library(xgboost)
+
+
+
+# 1) Unpivot to long, computing AST/TOV ratio per game
+nba_games <- bind_rows( nba_box_final %>%
+    transmute(
+      game_id = home_game_id,
+      date    = as.Date(home_game_date),
+      team    = home_team_display_name,
+      FG_PCT  = home_field_goal_pct,
+      FG_MADE = home_field_goals_made,
+      REB     = home_total_rebounds,
+      FG3_PCT = home_three_point_field_goal_pct,
+      `3PM`   = home_three_point_field_goals_made,
+      `3PA`   = home_three_point_field_goals_attempted,
+      AST     = home_assists,
+      BLK     = home_blocks,
+      STL     = home_steals,
+      TOV     = home_turnovers
+    ),
+  nba_box_final %>%
+    transmute(
+      game_id = home_game_id,
+      date    = as.Date(home_game_date),
+      team    = away_team_display_name,
+      FG_PCT  = away_field_goal_pct,
+      FG_MADE = away_field_goals_made,
+      REB     = away_total_rebounds,
+      FG3_PCT = away_three_point_field_goal_pct,
+      `3PM`   = away_three_point_field_goals_made,
+      `3PA`   = away_three_point_field_goals_attempted,
+      AST     = away_assists,
+      BLK     = away_blocks,
+      STL     = away_steals,
+      TOV     = away_turnovers
+    )
+) %>%
+  # compute 3‑pt% and AST/TOV ratio
+  mutate(
+    FG3_PCT = if_else(`3PA` > 0, `3PM` / `3PA`, NA_real_),
+    AST_TOV = if_else(TOV   > 0, AST    / TOV,   NA_real_)
+  )
+
+# 2) Compute 5‑game trailing averages of each metric
+W <- 5
+W15 <- 15
+W30 <- 30
+# 2a) Compute the trailing averages
+ma_stats <- nba_games %>%
+  arrange(team, date) %>%
+  group_by(team) %>%
+  mutate(
+    MA5_FG_PCT  = slide_dbl(lag(FG_PCT),   ~ mean(.x, na.rm=TRUE), .before=4, .complete=TRUE),
+    MA5_FG_MADE = slide_dbl(lag(FG_MADE),  ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_REB     = slide_dbl(lag(REB),      ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_FG3_PCT = slide_dbl(lag(FG3_PCT),  ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_3PM     = slide_dbl(lag(`3PM`),    ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_AST     = slide_dbl(lag(AST),      ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_TOV     = slide_dbl(lag(TOV),      ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_AST_TOV = slide_dbl(lag(AST_TOV),  ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_BLK     = slide_dbl(lag(BLK),      ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA5_STL     = slide_dbl(lag(STL),      ~ mean(.x, na.rm=TRUE), .before=W-1, .complete=TRUE),
+    MA15_FG_PCT  = slide_dbl(lag(FG_PCT),   ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_FG_MADE = slide_dbl(lag(FG_MADE),  ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_REB     = slide_dbl(lag(REB),      ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_FG3_PCT = slide_dbl(lag(FG3_PCT),  ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_3PM     = slide_dbl(lag(`3PM`),    ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_AST     = slide_dbl(lag(AST),      ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_TOV     = slide_dbl(lag(TOV),      ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_AST_TOV = slide_dbl(lag(AST_TOV),  ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_BLK     = slide_dbl(lag(BLK),      ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA15_STL     = slide_dbl(lag(STL),      ~ mean(.x, na.rm=TRUE), .before=W15-1, .complete=TRUE),
+    MA30_FG_PCT  = slide_dbl(lag(FG_PCT),   ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_FG_MADE = slide_dbl(lag(FG_MADE),  ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_REB     = slide_dbl(lag(REB),      ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_FG3_PCT = slide_dbl(lag(FG3_PCT),  ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_3PM     = slide_dbl(lag(`3PM`),    ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_AST     = slide_dbl(lag(AST),      ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_TOV     = slide_dbl(lag(TOV),      ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_AST_TOV = slide_dbl(lag(AST_TOV),  ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_BLK     = slide_dbl(lag(BLK),      ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE),
+    MA30_STL     = slide_dbl(lag(STL),      ~ mean(.x, na.rm=TRUE), .before=W30-1, .complete=TRUE)
+  ) %>%
+  ungroup()
+```
+```{r}
+# 3) Pivot MAs back onto your wide data
+home_ma <- ma_stats %>%
+  rename_with(~ paste0("home_", .), -c(game_id, date, team)) %>%
+  rename(home_team_display_name = team)
+
+away_ma <- ma_stats %>%
+  rename_with(~ paste0("away_", .), -c(game_id, date, team)) %>%
+  rename(away_team_display_name = team)
+
+model_df <- nba_box_final %>%
+  left_join(home_ma, by = c("home_game_id" = "game_id", "home_team_display_name")) %>%
+  left_join(away_ma, by = c("home_game_id" = "game_id", "away_team_display_name"))
+
+# 4) Create your diff_MA5_… features
+model_df <- model_df %>%
+  mutate(
+    diff_FG_PCT   = home_MA5_FG_PCT  - away_MA5_FG_PCT,
+    diff_FG_MADE  = home_MA5_FG_MADE - away_MA5_FG_MADE,
+    diff_REB      = home_MA5_REB     - away_MA5_REB,
+    diff_FG3_PCT  = home_MA5_FG3_PCT - away_MA5_FG3_PCT,
+    diff_3PM      = home_MA5_3PM     - away_MA5_3PM,
+    diff_AST      = home_MA5_AST     - away_MA5_AST,
+    diff_TOV      = home_MA5_TOV     - away_MA5_TOV,
+    diff_AST_TOV  = home_MA5_AST_TOV - away_MA5_AST_TOV,
+    diff_BLK      = home_MA5_BLK     - away_MA5_BLK,
+    diff_STL      = home_MA5_STL     - away_MA5_STL,
+    point_margin  = home_team_score  - away_team_score,
+    win           = as.integer(point_margin > 0),
+    diff_FG_PCT15   = home_MA15_FG_PCT  - away_MA15_FG_PCT,
+    diff_FG_MADE15  = home_MA15_FG_MADE - away_MA15_FG_MADE,
+    diff_REB15      = home_MA15_REB     - away_MA15_REB,
+    diff_FG3_PCT15  = home_MA15_FG3_PCT - away_MA15_FG3_PCT,
+    diff_3PM15      = home_MA15_3PM     - away_MA15_3PM,
+    diff_AST15      = home_MA15_AST     - away_MA15_AST,
+    diff_TOV15      = home_MA15_TOV     - away_MA15_TOV,
+    diff_AST_TOV15  = home_MA15_AST_TOV - away_MA15_AST_TOV,
+    diff_BLK15      = home_MA15_BLK     - away_MA15_BLK,
+    diff_STL15      = home_MA15_STL     - away_MA15_STL,
+    diff_FG_PCT30   = home_MA30_FG_PCT  - away_MA30_FG_PCT,
+    diff_FG_MADE30  = home_MA30_FG_MADE - away_MA30_FG_MADE,
+    diff_REB30      = home_MA30_REB     - away_MA30_REB,
+    diff_FG3_PCT30  = home_MA30_FG3_PCT - away_MA30_FG3_PCT,
+    diff_3PM30      = home_MA30_3PM     - away_MA30_3PM,
+    diff_AST30      = home_MA30_AST     - away_MA30_AST,
+    diff_TOV30      = home_MA30_TOV     - away_MA30_TOV,
+    diff_AST_TOV30  = home_MA30_AST_TOV - away_MA30_AST_TOV,
+    diff_BLK30      = home_MA30_BLK     - away_MA30_BLK,
+    diff_STL30      = home_MA30_STL     - away_MA30_STL
+  )
+```
+```{r}
+# --- Advanced stats + ELO integration ---
+adv_stats <- read.csv("D:/S&Z 500 NBA/Merged_ELO_AdvancedStats.csv",
+                      stringsAsFactors = FALSE) %>%
+  # replace spaces or dots with underscores, then lowercase
+  rename_with(~ str_replace_all(., "[[:space:]\\.]", "_")) %>%
+  rename_with(tolower)
+
+# Home‐prefixed version
+adv_home <- adv_stats %>%
+  rename(
+    home_team_display_name = team_name,
+    home_season            = season
+  ) %>%
+  rename_with(~ paste0("home_", .), -c(home_team_display_name, home_season))
+
+# Away‐prefixed version
+adv_away <- adv_stats %>%
+  rename(
+    away_team_display_name = team_name,
+    away_season            = season
+  ) %>%
+  rename_with(~ paste0("away_", .), -c(away_team_display_name, away_season))
+
+model_df <- model_df %>%
+  left_join(adv_home,
+            by = c("home_team_display_name", "home_season")) %>%
+  left_join(adv_away,
+            by = c("away_team_display_name", "away_season"))
+
+# Compute diff_… columns including ELO + advanced stats
+model_df <- model_df %>%
+  mutate(
+    diff_elo_rating = home_elo_rating - away_elo_rating,
+    diff_off_rating = home_off_rating - away_off_rating,
+    diff_def_rating = home_def_rating - away_def_rating,
+    diff_net_rating = home_net_rating - away_net_rating,
+    diff_pace       = home_pace     - away_pace,
+    diff_pie        = home_pie      - away_pie,
+    win             = as.integer(point_margin > 0)
+  )
+# 2a) grab raw rolling‐average columns by window
+home_ma5_feats  <- grep("^home_MA5",  names(model_df), value=TRUE)
+away_ma5_feats  <- grep("^away_MA5",  names(model_df), value=TRUE)
+home_ma15_feats <- grep("^home_MA15", names(model_df), value=TRUE)
+away_ma15_feats <- grep("^away_MA15", names(model_df), value=TRUE)
+home_ma30_feats <- grep("^home_MA30", names(model_df), value=TRUE)
+away_ma30_feats <- grep("^away_MA30", names(model_df), value=TRUE)
+
+# 2b) grab *all* your diff_… columns
+diff_adv_feats <- grep(
+  "^diff_(elo_rating|off_rating|def_rating|net_rating|pace|pie)$",
+  names(model_df),
+  value = TRUE
+)
+diff_ma_feats <- grep("^diff_MA(5|15|30)_", names(model_df), value = TRUE)
+
+# 2c) combine into one vector, in whatever order you like
+feature_cols <- c(
+  home_ma5_feats, away_ma5_feats,
+  home_ma15_feats, away_ma15_feats,
+  home_ma30_feats, away_ma30_feats,
+  diff_adv_feats, diff_ma_feats
+)
+
+```
+```{r}
+get_season_string <- function(date_of_match) {
+  date_of_match <- as.Date(date_of_match)
+  yr <- as.integer(format(date_of_match, "%Y"))
+  mo <- as.integer(format(date_of_match, "%m"))
+  if (mo >= 10) {
+    start     <- yr
+    end_short <- substr(as.character(yr + 1), 3, 4)
+  } else {
+    start     <- yr - 1
+    end_short <- substr(as.character(yr),     3, 4)
+  }
+  paste0(start, "-", end_short)
+}
+
+```
+```{r}
+set.seed(42069)  
+n   <- nrow(model_df)
+train_idx <- sample.int(n, size = floor(0.8 * n))  # 80% of rows
+test_idx  <- setdiff(seq_len(n), train_idx)
+
+X      <- data.matrix(model_df[, feature_cols])
+y      <- model_df$point_margin
+
+dtrain <- xgb.DMatrix(X[train_idx,], label = y[train_idx])
+dtest  <- xgb.DMatrix(X[test_idx, ], label = y[test_idx])
+
+bst_reg <- xgb.train(
+  params                = list(objective="reg:squarederror",
+                               eval_metric="rmse",
+                               eta         = 0.005,
+                               max_depth   = 6),
+  data                  = dtrain,
+  nrounds               = 200,
+  watchlist             = list(train=dtrain, test=dtest),
+  early_stopping_rounds = 10
+)
+
+```
+
+```{r}
+predict_matchup <- function(home_team, away_team, date_of_match) {
+  # 0) prep date & season
+  date_of_match <- as.Date(date_of_match)
+  season_input  <- get_season_string(date_of_match)
+
+  # 1) rolling‐averages
+  h_ma <- home_ma %>%
+    filter(home_team_display_name == home_team, date <= date_of_match) %>%
+    slice_max(date, n = 1, with_ties = FALSE)
+  a_ma <- away_ma %>%
+    filter(away_team_display_name == away_team, date <= date_of_match) %>%
+    slice_max(date, n = 1, with_ties = FALSE)
+  if (nrow(h_ma)!=1 || nrow(a_ma)!=1) {
+    stop("Couldn’t find MA data on or before ", date_of_match)
+  }
+
+  # 2) advanced/ELO lookup
+  adv_cols <- c("elo_rating","off_rating","def_rating","net_rating","pace","pie")
+  h_adv_df <- adv_stats %>%
+    filter(team_name == home_team, season == season_input) %>%
+    slice_head(n = 1) %>%
+    select(all_of(adv_cols))
+  a_adv_df <- adv_stats %>%
+    filter(team_name == away_team, season == season_input) %>%
+    slice_head(n = 1) %>%
+    select(all_of(adv_cols))
+  if (nrow(h_adv_df)!=1 || nrow(a_adv_df)!=1) {
+    stop("Missing advanced/ELO for one or both teams in season ", season_input)
+  }
+  names(h_adv_df) <- paste0("home_", adv_cols)
+  names(a_adv_df) <- paste0("away_", adv_cols)
+
+  # 3) diffs for advanced/ELO
+  diff_adv <- purrr::map_dbl(adv_cols, function(col) {
+    h_adv_df[[paste0("home_", col)]] - a_adv_df[[paste0("away_", col)]]
+  }) %>% set_names(paste0("diff_", adv_cols))
+
+  # 4) diffs for MA stats
+  home_ma_feats <- grep("^home_MA",  names(h_ma), value = TRUE)
+  away_ma_feats <- sub("^home_", "away_", home_ma_feats)
+  diff_ma <- purrr::map_dbl(home_ma_feats, function(col) {
+    h_ma[[col]] - a_ma[[sub("^home_", "away_", col)]]
+  }) %>% set_names(paste0("diff_", sub("^home_", "", home_ma_feats)))
+
+  # 5) assemble feature row
+  new_obs <- bind_cols(
+    h_ma    %>% select(all_of(home_ma_feats)),
+    a_ma    %>% select(all_of(away_ma_feats)),
+    h_adv_df, a_adv_df,
+    as_tibble(t(diff_adv)),
+    as_tibble(t(diff_ma))
+  ) %>% select(all_of(feature_cols))
+
+  # 6) — **only** change here — build DMatrix _without_ feature_names
+  dm          <- xgb.DMatrix(data = as.matrix(new_obs))
+  pred_margin <- predict(bst_reg, dm)[1]
+
+  # 7) winner & output
+  pred_winner <- if (pred_margin > 0) home_team else away_team
+  tibble(
+    date      = date_of_match,
+    season    = season_input,
+    home_team = home_team,
+    away_team = away_team,
+    margin    = pred_margin,
+    winner    = pred_winner
+  )
+}
+
+
+```
+```{r}
+# 1) Compute the importance matrix
+importance_matrix <- xgb.importance(
+  feature_names = feature_cols,
+  model         = bst_reg
+)
+
+# 2) View the raw importance scores
+print(importance_matrix)
+#    (columns include: Feature, Gain, Cover, Frequency)
+
+# 3) Plot the top 20 most important features
+xgb.plot.importance(
+  importance_matrix,
+  top_n = 20,
+  measure = "Gain"        # you can also use "Cover" or "Frequency"
+)
+```
+
+```{r}
+# 1) Get predictions on the test set
+pred_margin   <- predict(bst_reg, dtest)
+actual_margin <- y[test_idx]
+
+# 2) Regression metrics
+rmse <- sqrt(mean((pred_margin - actual_margin)^2))
+mae  <- mean(abs(pred_margin - actual_margin))
+
+cat("Test RMSE:", rmse, "\n")
+cat("Test MAE: ", mae,  "\n\n")
+
+# 3) Classification via zero threshold
+pred_win   <- ifelse(pred_margin > 0, 1L, 0L)
+actual_win <- as.integer(actual_margin > 0)
+
+accuracy <- mean(pred_win == actual_win)
+cat("Win/Loss accuracy:", accuracy, "\n")
+
+# 4) Confusion matrix
+cm <- table(Predicted = pred_win, Actual = actual_win)
+print(cm)
+
+# 5) Optionally, ROC / AUC
+# install.packages("pROC")
+library(pROC)
+roc_obj <- roc(actual_win, pred_margin)  # using margin as “score”
+cat("AUC:", auc(roc_obj), "\n")
+```
+```{r}
+result <- predict_matchup("Indiana Pacers",
+                "New York Knicks",
+                "2025-05-27")
+print(result)
+```
+

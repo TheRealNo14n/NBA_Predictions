@@ -1,0 +1,33 @@
+---
+title: "NBA Elo Project"
+author: "Thomas Zwiller"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(hoopR)
+library(dplyr)
+```
+
+Game Info
+```{r}
+years <-  list(2002:2025)
+
+seasons <- NULL
+
+for (year in years){
+  temp_season <-  load_nba_schedule(year)
+  seasons <- rbind(seasons, temp_season, fill = TRUE)}
+
+write.csv(seasons, "D:/S&Z 500 NBA/2002-2025 NBA Season Data.csv")
+```
+
+```{r}
+
+betting_data = espn_nba_betting("401585716")
+
+
+try(espn_nba_betting(game_id = 401283399))
+
+```
