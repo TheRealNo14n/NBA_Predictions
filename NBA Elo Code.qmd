@@ -20,7 +20,6 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import random
-from random import randrange
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -31,11 +30,10 @@ List Helper Function
 ```{python}
 def game_outcome(win_prob, team1, team2):
     """
-    Simulate the outcome of a game given the favorite's win probability.
-    Returns team1 if the favorite wins, else team2.
+    Simulate the outcome of a game.
+    Returns team1 with probability win_prob, else team2.
     """
-    sim_prob = randrange(1, 100) / 100  # simulated probability (0.01 to 0.99)
-    if win_prob > sim_prob:
+    if random.random() < win_prob:
         return team1
     else:
         return team2
@@ -56,12 +54,8 @@ def game_odds(team_rating, opp_team_rating):
 Game Sim Function
 ```{python}
 def simulate_game(team1, team2):
-    rating1 = team_ratings[team1]
-    rating2 = team_ratings[team2]
-    if rating1 < rating2:
-        team1, team2 = team2, team1
-        rating1, rating2 = rating2, rating1
-    win_prob = game_odds(rating1, rating2)
+    # game_odds is symmetric, so no need to reorder by rating
+    win_prob = game_odds(teams[team1], teams[team2])
     return game_outcome(win_prob, team1, team2)
 ```
 
@@ -81,13 +75,9 @@ def play_in_func(game_list):
     loser_location = game_list[7]
     advance_round = game_list[8]
 
-    team_a_rating = teams[team_a] + 75
-    team_b_rating = teams[team_b]
-    if team_a_rating < team_b_rating:
-        team_a, team_b = team_b, team_a
-        team_a_rating, team_b_rating = team_b_rating, team_a_rating
-    win_prob = game_odds(team_a_rating, team_b_rating)
-    winner = game_outcome(win_prob, team_a, team_b)
+    # team_a is the home team in a play-in game, so it gets the +75 boost
+    team_a_win_prob = game_odds(teams[team_a] + 75, teams[team_b])
+    winner = game_outcome(team_a_win_prob, team_a, team_b)
 
     if winner == team_a:
         winner_destination[winner_location] = team_a
@@ -135,22 +125,8 @@ def playoff_func(game_list):
         home_team = team_a if is_home else team_b
         away_team = team_b if is_home else team_a
 
-        home_rating = teams[home_team] + 75
-        away_rating = teams[away_team]
-
-        if home_rating > away_rating:
-            favored_team = home_team
-            underdog_team = away_team
-            favored_rating = home_rating
-            underdog_rating = away_rating
-        else:
-            favored_team = away_team
-            underdog_team = home_team
-            favored_rating = away_rating
-            underdog_rating = home_rating
-
-        win_prob = game_odds(favored_rating, underdog_rating)
-        winner = game_outcome(win_prob, favored_team, underdog_team)
+        home_win_prob = game_odds(teams[home_team] + 75, teams[away_team])
+        winner = game_outcome(home_win_prob, home_team, away_team)
 
 # Update win counts based on winner
         if winner == team_a:
@@ -244,13 +220,17 @@ for year in range(2002, 2026, 1):
       away_team_win_prob = 1 - home_team_win_prob
 
       # Update ratings
-      if home_score > away_score:
-        margin = abs(home_score - away_score)
-      else:
-        margin = abs(away_score - home_score)
+      margin = abs(home_score - away_score)
 
-      K = 15 * math.log(margin + 1, 10)
-      #K = 20
+      # FiveThirtyEight-style margin-of-victory multiplier: dampens the
+      # boost when the favorite wins big, so strong teams aren't
+      # over-credited for blowouts they were expected to deliver
+      if home_score > away_score:
+        winner_elo_diff = home_team_rating - away_team_rating
+      else:
+        winner_elo_diff = away_team_rating - home_team_rating
+
+      K = 20 * ((margin + 3) ** 0.8) / (7.5 + 0.006 * winner_elo_diff)
 
       #update ratings based on the margin
       if home_score > away_score:
@@ -270,19 +250,13 @@ for year in range(2002, 2026, 1):
         else:
             count += 1
 
-    team_average = sum(teams.values()) / len(teams)
-
     for team in teams:
         concatenated_team = team + '-' + str(year)
         season_elo_dict[concatenated_team] = teams[team]
 
+    # regress every team 30% of the way back to the 1500 mean between seasons
     for team in teams:
-        if teams[team] >= team_average:
-            team_modifier = (teams[team] - 1500) * .30
-            teams[team] = teams[team] - team_modifier
-        else:
-            teams_modifier = (1500 - teams[team]) * .30
-            teams[team] = teams[team] + teams_modifier
+        teams[team] = 0.70 * teams[team] + 0.30 * 1500
 
     nba_season_data.loc[year_data.index, ['pre_home_elo', 'pre_away_elo']] = year_data[['pre_home_elo', 'pre_away_elo']]
 
@@ -303,6 +277,15 @@ season_elo_dict_df = season_elo_dict_df[~season_elo_dict_df['Team-Year'].str.con
 season_elo_dict_df = season_elo_dict_df[['Team-Year', 'Elo Rating']].sort_values(by = 'Elo Rating', ascending = False, ignore_index = True)
 season_elo_dict_df.to_csv('D:/S&Z 500 NBA/NBA 2025 Elo Ratings by Year.csv', index = True)
 
+# Export each game's PRE-game Elo so the prediction model only ever sees
+# information available before tip-off (end-of-season Elo leaks the future)
+game_id_col = 'game_id' if 'game_id' in nba_season_data.columns else 'id'
+pre_game_elo = nba_season_data[[game_id_col, 'date', 'home_display_name',
+                                'away_display_name', 'pre_home_elo',
+                                'pre_away_elo']].rename(columns={game_id_col: 'game_id'})
+pre_game_elo = pre_game_elo.dropna(subset=['pre_home_elo', 'pre_away_elo'])
+pre_game_elo.to_csv('D:/S&Z 500 NBA/NBA Pre-Game Elo.csv', index=False)
+
 print(f"Accuracy: {right/count:.2%}")
 ```
 
@@ -321,6 +304,8 @@ team_progress = {
 }
 
 num_sims = int(input("Please enter the number of simulations: \n"))
+
+random.seed(42069)  # reproducible simulations
 
 for i in range(num_sims):
     #The Finals
@@ -348,7 +333,7 @@ for i in range(num_sims):
     west_series_4 = ['Denver Nuggets', 4, 1, 'LA Clippers', 5, 1, west_semi_1, 3 , 'Semifinals']
     west_series_3 = ['Los Angeles Lakers', 3, 0, 'Minnesota Timberwolves', 6, 1, west_semi_2, 3, 'Semifinals']
     west_series_2 = ['Houston Rockets', 2, 0, 'Golden State Warriors', 7, 1, west_semi_2, 0 , 'Semifinals']
-    west_series_1 = ['Oklahoma City Thunder', 0, 1, 'Memphis Grizzlies', 8, 0, west_semi_1, 0 , 'Semifinals']
+    west_series_1 = ['Oklahoma City Thunder', 1, 1, 'Memphis Grizzlies', 8, 0, west_semi_1, 0 , 'Semifinals']
 
     #East Play-In
     #east_play_in_3 = ['Atlanta Hawks', 7, 'Miami Heat', 10, east_series_1, 3, None, None, 'First Round']
@@ -414,7 +399,8 @@ df_progress['First Round'] = df_progress['First Round'].fillna('-')
 
 df_progress = df_progress.rename(columns={'Play-In': 'Play-In Elim'})
 
-df_progress = pd.merge(df_progress, logo_df, how='left')
+if 'logo_df' in globals():
+    df_progress = pd.merge(df_progress, logo_df, how='left')
 
 df_progress = pd.merge(df_progress, team_ratings_df, how='left')
 
@@ -950,45 +936,49 @@ away_ma <- ma_stats %>%
   rename_with(~ paste0("away_", .), -c(game_id, date, team)) %>%
   rename(away_team_display_name = team)
 
-model_df <- nba_box_final %>%
+# use nba_box_clean so All-Star games and the partial 2001-02 season
+# don't end up in the training data
+model_df <- nba_box_clean %>%
   left_join(home_ma, by = c("home_game_id" = "game_id", "home_team_display_name")) %>%
   left_join(away_ma, by = c("home_game_id" = "game_id", "away_team_display_name"))
 
 # 4) Create your diff_MA5_… features
+# Named diff_MA5_/diff_MA15_/diff_MA30_ so they match the
+# "^diff_MA(5|15|30)_" pattern used to build feature_cols below
 model_df <- model_df %>%
   mutate(
-    diff_FG_PCT   = home_MA5_FG_PCT  - away_MA5_FG_PCT,
-    diff_FG_MADE  = home_MA5_FG_MADE - away_MA5_FG_MADE,
-    diff_REB      = home_MA5_REB     - away_MA5_REB,
-    diff_FG3_PCT  = home_MA5_FG3_PCT - away_MA5_FG3_PCT,
-    diff_3PM      = home_MA5_3PM     - away_MA5_3PM,
-    diff_AST      = home_MA5_AST     - away_MA5_AST,
-    diff_TOV      = home_MA5_TOV     - away_MA5_TOV,
-    diff_AST_TOV  = home_MA5_AST_TOV - away_MA5_AST_TOV,
-    diff_BLK      = home_MA5_BLK     - away_MA5_BLK,
-    diff_STL      = home_MA5_STL     - away_MA5_STL,
+    diff_MA5_FG_PCT   = home_MA5_FG_PCT  - away_MA5_FG_PCT,
+    diff_MA5_FG_MADE  = home_MA5_FG_MADE - away_MA5_FG_MADE,
+    diff_MA5_REB      = home_MA5_REB     - away_MA5_REB,
+    diff_MA5_FG3_PCT  = home_MA5_FG3_PCT - away_MA5_FG3_PCT,
+    diff_MA5_3PM      = home_MA5_3PM     - away_MA5_3PM,
+    diff_MA5_AST      = home_MA5_AST     - away_MA5_AST,
+    diff_MA5_TOV      = home_MA5_TOV     - away_MA5_TOV,
+    diff_MA5_AST_TOV  = home_MA5_AST_TOV - away_MA5_AST_TOV,
+    diff_MA5_BLK      = home_MA5_BLK     - away_MA5_BLK,
+    diff_MA5_STL      = home_MA5_STL     - away_MA5_STL,
     point_margin  = home_team_score  - away_team_score,
     win           = as.integer(point_margin > 0),
-    diff_FG_PCT15   = home_MA15_FG_PCT  - away_MA15_FG_PCT,
-    diff_FG_MADE15  = home_MA15_FG_MADE - away_MA15_FG_MADE,
-    diff_REB15      = home_MA15_REB     - away_MA15_REB,
-    diff_FG3_PCT15  = home_MA15_FG3_PCT - away_MA15_FG3_PCT,
-    diff_3PM15      = home_MA15_3PM     - away_MA15_3PM,
-    diff_AST15      = home_MA15_AST     - away_MA15_AST,
-    diff_TOV15      = home_MA15_TOV     - away_MA15_TOV,
-    diff_AST_TOV15  = home_MA15_AST_TOV - away_MA15_AST_TOV,
-    diff_BLK15      = home_MA15_BLK     - away_MA15_BLK,
-    diff_STL15      = home_MA15_STL     - away_MA15_STL,
-    diff_FG_PCT30   = home_MA30_FG_PCT  - away_MA30_FG_PCT,
-    diff_FG_MADE30  = home_MA30_FG_MADE - away_MA30_FG_MADE,
-    diff_REB30      = home_MA30_REB     - away_MA30_REB,
-    diff_FG3_PCT30  = home_MA30_FG3_PCT - away_MA30_FG3_PCT,
-    diff_3PM30      = home_MA30_3PM     - away_MA30_3PM,
-    diff_AST30      = home_MA30_AST     - away_MA30_AST,
-    diff_TOV30      = home_MA30_TOV     - away_MA30_TOV,
-    diff_AST_TOV30  = home_MA30_AST_TOV - away_MA30_AST_TOV,
-    diff_BLK30      = home_MA30_BLK     - away_MA30_BLK,
-    diff_STL30      = home_MA30_STL     - away_MA30_STL
+    diff_MA15_FG_PCT   = home_MA15_FG_PCT  - away_MA15_FG_PCT,
+    diff_MA15_FG_MADE  = home_MA15_FG_MADE - away_MA15_FG_MADE,
+    diff_MA15_REB      = home_MA15_REB     - away_MA15_REB,
+    diff_MA15_FG3_PCT  = home_MA15_FG3_PCT - away_MA15_FG3_PCT,
+    diff_MA15_3PM      = home_MA15_3PM     - away_MA15_3PM,
+    diff_MA15_AST      = home_MA15_AST     - away_MA15_AST,
+    diff_MA15_TOV      = home_MA15_TOV     - away_MA15_TOV,
+    diff_MA15_AST_TOV  = home_MA15_AST_TOV - away_MA15_AST_TOV,
+    diff_MA15_BLK      = home_MA15_BLK     - away_MA15_BLK,
+    diff_MA15_STL      = home_MA15_STL     - away_MA15_STL,
+    diff_MA30_FG_PCT   = home_MA30_FG_PCT  - away_MA30_FG_PCT,
+    diff_MA30_FG_MADE  = home_MA30_FG_MADE - away_MA30_FG_MADE,
+    diff_MA30_REB      = home_MA30_REB     - away_MA30_REB,
+    diff_MA30_FG3_PCT  = home_MA30_FG3_PCT - away_MA30_FG3_PCT,
+    diff_MA30_3PM      = home_MA30_3PM     - away_MA30_3PM,
+    diff_MA30_AST      = home_MA30_AST     - away_MA30_AST,
+    diff_MA30_TOV      = home_MA30_TOV     - away_MA30_TOV,
+    diff_MA30_AST_TOV  = home_MA30_AST_TOV - away_MA30_AST_TOV,
+    diff_MA30_BLK      = home_MA30_BLK     - away_MA30_BLK,
+    diff_MA30_STL      = home_MA30_STL     - away_MA30_STL
   )
 ```
 ```{r}
@@ -998,6 +988,18 @@ adv_stats <- read.csv("D:/S&Z 500 NBA/Merged_ELO_AdvancedStats.csv",
   # replace spaces or dots with underscores, then lowercase
   rename_with(~ str_replace_all(., "[[:space:]\\.]", "_")) %>%
   rename_with(tolower)
+
+# These stats (and the season Elo) are full-season aggregates, so they
+# contain the outcome of every game in that season. Relabel each season's
+# stats as inputs for the FOLLOWING season so a game is only ever
+# predicted with information available before it was played.
+next_season_string <- function(season) {
+  start <- as.integer(substr(season, 1, 4)) + 1
+  sprintf("%d-%02d", start, (start + 1) %% 100)
+}
+
+adv_stats <- adv_stats %>%
+  mutate(season = next_season_string(season))
 
 # Home‐prefixed version
 adv_home <- adv_stats %>%
@@ -1021,9 +1023,24 @@ model_df <- model_df %>%
   left_join(adv_away,
             by = c("away_team_display_name", "away_season"))
 
+# Per-game PRE-game Elo (computed during the Elo loop above) — unlike the
+# season-level elo_rating, this only reflects games played before tip-off
+pre_elo <- read.csv("D:/S&Z 500 NBA/NBA Pre-Game Elo.csv",
+                    stringsAsFactors = FALSE) %>%
+  select(game_id, pre_home_elo, pre_away_elo)
+
+# Latest Elo ratings, used by predict_matchup for upcoming games
+current_elo <- read.csv("D:/S&Z 500 NBA/NBA 2025 Elo Ratings.csv",
+                        stringsAsFactors = FALSE) %>%
+  transmute(team = Team, elo = Elo.Rating)
+
+model_df <- model_df %>%
+  left_join(pre_elo, by = c("home_game_id" = "game_id"))
+
 # Compute diff_… columns including ELO + advanced stats
 model_df <- model_df %>%
   mutate(
+    diff_pre_elo    = pre_home_elo - pre_away_elo,
     diff_elo_rating = home_elo_rating - away_elo_rating,
     diff_off_rating = home_off_rating - away_off_rating,
     diff_def_rating = home_def_rating - away_def_rating,
@@ -1053,6 +1070,7 @@ feature_cols <- c(
   home_ma5_feats, away_ma5_feats,
   home_ma15_feats, away_ma15_feats,
   home_ma30_feats, away_ma30_feats,
+  "pre_home_elo", "pre_away_elo", "diff_pre_elo",
   diff_adv_feats, diff_ma_feats
 )
 
@@ -1074,10 +1092,14 @@ get_season_string <- function(date_of_match) {
 
 ```
 ```{r}
-set.seed(42069)  
-n   <- nrow(model_df)
-train_idx <- sample.int(n, size = floor(0.8 * n))  # 80% of rows
-test_idx  <- setdiff(seq_len(n), train_idx)
+set.seed(42069)
+
+# Temporal split: train on past seasons, test on the most recent ones.
+# A random split puts games from the same week in both train and test,
+# which inflates accuracy relative to predicting genuinely unseen games.
+test_seasons <- c("2023-24", "2024-25")
+train_idx <- which(!(model_df$home_season %in% test_seasons))
+test_idx  <- which(model_df$home_season %in% test_seasons)
 
 X      <- data.matrix(model_df[, feature_cols])
 y      <- model_df$point_margin
@@ -1088,12 +1110,14 @@ dtest  <- xgb.DMatrix(X[test_idx, ], label = y[test_idx])
 bst_reg <- xgb.train(
   params                = list(objective="reg:squarederror",
                                eval_metric="rmse",
-                               eta         = 0.005,
-                               max_depth   = 6),
+                               eta              = 0.05,
+                               max_depth        = 6,
+                               subsample        = 0.8,
+                               colsample_bytree = 0.8),
   data                  = dtrain,
-  nrounds               = 200,
+  nrounds               = 3000,
   watchlist             = list(train=dtrain, test=dtest),
-  early_stopping_rounds = 10
+  early_stopping_rounds = 50
 )
 
 ```
@@ -1131,6 +1155,13 @@ predict_matchup <- function(home_team, away_team, date_of_match) {
   names(h_adv_df) <- paste0("home_", adv_cols)
   names(a_adv_df) <- paste0("away_", adv_cols)
 
+  # 2b) pre-game Elo: each team's latest rating
+  h_elo <- current_elo$elo[current_elo$team == home_team]
+  a_elo <- current_elo$elo[current_elo$team == away_team]
+  if (length(h_elo) != 1 || length(a_elo) != 1) {
+    stop("Missing current Elo rating for one or both teams")
+  }
+
   # 3) diffs for advanced/ELO
   diff_adv <- purrr::map_dbl(adv_cols, function(col) {
     h_adv_df[[paste0("home_", col)]] - a_adv_df[[paste0("away_", col)]]
@@ -1148,6 +1179,9 @@ predict_matchup <- function(home_team, away_team, date_of_match) {
     h_ma    %>% select(all_of(home_ma_feats)),
     a_ma    %>% select(all_of(away_ma_feats)),
     h_adv_df, a_adv_df,
+    tibble(pre_home_elo = h_elo,
+           pre_away_elo = a_elo,
+           diff_pre_elo = h_elo - a_elo),
     as_tibble(t(diff_adv)),
     as_tibble(t(diff_ma))
   ) %>% select(all_of(feature_cols))
@@ -1207,6 +1241,13 @@ actual_win <- as.integer(actual_margin > 0)
 
 accuracy <- mean(pred_win == actual_win)
 cat("Win/Loss accuracy:", accuracy, "\n")
+
+# Baselines the model needs to beat
+home_baseline <- mean(actual_win)
+elo_pick <- as.integer(model_df$diff_pre_elo[test_idx] > -75)  # Elo + home court
+elo_baseline <- mean(elo_pick == actual_win, na.rm = TRUE)
+cat("Baseline — home team always wins:", home_baseline, "\n")
+cat("Baseline — pre-game Elo + home court:", elo_baseline, "\n")
 
 # 4) Confusion matrix
 cm <- table(Predicted = pred_win, Actual = actual_win)
